@@ -23,6 +23,10 @@
 #include "split-index.h"
 #include "utf8.h"
 #include "fsmonitor.h"
+#ifndef NO_PTHREADS
+#include <pthread.h>
+#include <thread-utils.h>
+#endif
 
 /* Mask for the name length in ce_flags in the on-disk index */
 
@@ -1898,6 +1902,46 @@ static unsigned long read_eoie_extension(void *mmap_, size_t mmap_size);
 #endif
 static void write_eoie_extension(struct strbuf *sb, git_hash_ctx *eoie_context, unsigned long offset);
 
+struct load_index_extensions
+{
+#ifndef NO_PTHREADS
+	pthread_t pthread;
+#endif
+	struct index_state *istate;
+	void *mmap;
+	size_t mmap_size;
+	unsigned long src_offset;
+};
+
+static void *load_index_extensions(void *_data)
+{
+	struct load_index_extensions *p = _data;
+	unsigned long src_offset = p->src_offset;
+
+	while (src_offset <= p->mmap_size - the_hash_algo->rawsz - 8) {
+		/* After an array of active_nr index entries,
+		 * there can be arbitrary number of extended
+		 * sections, each of which is prefixed with
+		 * extension name (4-byte) and section length
+		 * in 4-byte network byte order.
+		 */
+		uint32_t extsize;
+		memcpy(&extsize, (char *)p->mmap + src_offset + 4, 4);
+		extsize = ntohl(extsize);
+		if (read_index_extension(p->istate,
+			(const char *)p->mmap + src_offset,
+			(char *)p->mmap + src_offset + 8,
+			extsize) < 0) {
+			munmap(p->mmap, p->mmap_size);
+			die("index file corrupt");
+		}
+		src_offset += 8;
+		src_offset += extsize;
+	}
+
+	return NULL;
+}
+
 /* remember to discard_cache() before reading a different cache! */
 int do_read_index(struct index_state *istate, const char *path, int must_exist)
 {
@@ -1908,6 +1952,11 @@ int do_read_index(struct index_state *istate, const char *path, int must_exist)
 	void *mmap;
 	size_t mmap_size;
 	struct strbuf previous_name_buf = STRBUF_INIT, *previous_name;
+	struct load_index_extensions p = { 0 };
+	unsigned long extension_offset = 0;
+#ifndef NO_PTHREADS
+	int nr_threads;
+#endif
 
 	if (istate->initialized)
 		return istate->cache_nr;
@@ -1944,6 +1993,26 @@ int do_read_index(struct index_state *istate, const char *path, int must_exist)
 	istate->cache = xcalloc(istate->cache_alloc, sizeof(*istate->cache));
 	istate->initialized = 1;
 
+	p.istate = istate;
+	p.mmap = mmap;
+	p.mmap_size = mmap_size;
+
+#ifndef NO_PTHREADS
+	nr_threads = git_config_get_index_threads();
+	if (!nr_threads)
+		nr_threads = online_cpus();
+
+	if (nr_threads >= 2) {
+		extension_offset = read_eoie_extension(mmap, mmap_size);
+		if (extension_offset) {
+			/* create a thread to load the index extensions */
+			p.src_offset = extension_offset;
+			if (pthread_create(&p.pthread, NULL, load_index_extensions, &p))
+				die(_("unable to create load_index_extensions_thread"));
+		}
+	}
+#endif
+
 	if (istate->version == 4) {
 		previous_name = &previous_name_buf;
 		mem_pool_init(&istate->ce_mem_pool,
@@ -1970,23 +2039,14 @@ int do_read_index(struct index_state *istate, const char *path, int must_exist)
 	istate->timestamp.sec = st.st_mtime;
 	istate->timestamp.nsec = ST_MTIME_NSEC(st);
 
-	while (src_offset <= mmap_size - the_hash_algo->rawsz - 8) {
-		/* After an array of active_nr index entries,
-		 * there can be arbitrary number of extended
-		 * sections, each of which is prefixed with
-		 * extension name (4-byte) and section length
-		 * in 4-byte network byte order.
-		 */
-		uint32_t extsize;
-		memcpy(&extsize, (char *)mmap + src_offset + 4, 4);
-		extsize = ntohl(extsize);
-		if (read_index_extension(istate,
-					 (const char *) mmap + src_offset,
-					 (char *) mmap + src_offset + 8,
-					 extsize) < 0)
-			goto unmap;
-		src_offset += 8;
-		src_offset += extsize;
+	/* if we created a thread, join it otherwise load the extensions on the primary thread */
+#ifndef NO_PTHREADS
+	if (extension_offset && pthread_join(p.pthread, NULL))
+		die(_("unable to join load_index_extensions_thread"));
+#endif
+	if (!extension_offset) {
+		p.src_offset = src_offset;
+		load_index_extensions(&p);
 	}
 	munmap(mmap, mmap_size);
 	return istate->cache_nr;
